@@ -63,29 +63,34 @@ async function uploadOne(fullpath) {
 }
 
 function startFfmpeg() {
-  // Catatan:
-  // -c copy = remux cepat (asumsi H.264/AAC); kalau tidak kompatibel, lihat opsi re-encode di bawah.
+  const ua     = process.env.UA || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36';
+  const ref    = process.env.REF || '';
+  const origin = process.env.ORIGIN || '';
+  const timeoutUs = String(parseInt(process.env.TIMEOUT_US || '15000000', 10)); // 15s
+
+  const headerLines = [];
+  if (ref)    headerLines.push(`Referer: ${ref}`);
+  if (origin) headerLines.push(`Origin: ${origin}`);
+  headerLines.push(`User-Agent: ${ua}`);
+  const headersArg = headerLines.join('\r\n');
+
   const args = [
     '-hide_banner', '-loglevel', 'warning',
+    '-rw_timeout', timeoutUs,
+    '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '10',
+    '-http_persistent', '0',
+    '-user_agent', ua,
+    '-headers', headersArg,
     '-i', M3U8_URL,
-    '-map', '0',
-    '-c', 'copy',
-    '-bsf:a', 'aac_adtstoasc',
-    '-f', 'segment',
-    '-segment_time', String(SEG_DUR),
-    '-reset_timestamps', '1',
+    '-map', '0', '-c', 'copy', '-bsf:a', 'aac_adtstoasc',
+    '-f', 'segment', '-segment_time', String(SEG_DUR), '-reset_timestamps', '1',
     '-segment_format', 'mp4',
     path.join(OUT_DIR, 'seg_%06d.mp4')
   ];
 
   console.log(`▶️  ffmpeg mulai segmenting (${SEG_DUR}s) ke: ${OUT_DIR}`);
   const ff = spawn('ffmpeg', args, { stdio: ['ignore', 'inherit', 'inherit'] });
-
-  ff.on('exit', (code) => {
-    console.log(`ℹ️  ffmpeg selesai (code: ${code}).`);
-    ffmpegRunning = false;
-  });
-
+  ff.on('exit', (code) => { console.log(`ℹ️  ffmpeg selesai (code: ${code}).`); ffmpegRunning = false; });
   return ff;
 }
 
