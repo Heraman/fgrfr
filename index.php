@@ -75,57 +75,137 @@ function catbox_upload(string $filePath, string $userhash, string $endpoint, int
         return [false, "File tidak ditemukan: $filePath"];
     }
 
-    for ($attempt = 1; $attempt <= $maxRetry; $attempt++) {
-        $ch = curl_init();
-        $cfile = curl_file_create($filePath, mime_content_type($filePath) ?: 'application/octet-stream', basename($filePath));
+    $mime = mime_content_type($filePath) ?: 'application/octet-stream';
+    $filename = basename($filePath);
 
-        $postFields = [
-            'reqtype'       => 'fileupload',
-            'userhash'      => $userhash,
-            'fileToUpload'  => $cfile,
-        ];
+    $shouldFallback = false;
 
-        curl_setopt_array($ch, [
-            CURLOPT_URL            => $endpoint,
-            CURLOPT_POST           => true,
-            CURLOPT_POSTFIELDS     => $postFields,
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_TIMEOUT        => 60,
-        ]);
+    if (function_exists('curl_init')) {
+        for ($attempt = 1; $attempt <= $maxRetry; $attempt++) {
+            $ch = curl_init();
+            $cfile = curl_file_create($filePath, $mime, $filename);
+            $postFields = [
+                'reqtype'      => 'fileupload',
+                'userhash'     => $userhash,
+                'fileToUpload' => $cfile,
+            ];
 
-        $response = curl_exec($ch);
-        $err      = curl_error($ch);
-        $code     = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        curl_close($ch);
+            curl_setopt_array($ch, [
+                CURLOPT_URL            => $endpoint,
+                CURLOPT_POST           => true,
+                CURLOPT_POSTFIELDS     => $postFields,
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_TIMEOUT        => 90,
+                // Kunci: paksa HTTP/1.1 + buang Expect:100-continue
+                CURLOPT_HTTP_VERSION   => CURL_HTTP_VERSION_1_1,
+                CURLOPT_HTTPHEADER     => [
+                    'Expect:',           // disable 100-continue
+                    'Connection: close',
+                    'User-Agent: PHP-cURL/1.1',
+                ],
+                // (opsional) jika jaringan rewel:
+                // CURLOPT_SSL_VERIFYPEER => true,
+                // CURLOPT_SSL_VERIFYHOST => 2,
+            ]);
 
-        if ($err) {
-            // cURL error, retry
-            if ($attempt < $maxRetry) {
-                sleep(2);
-                continue;
-            }
-            return [false, "cURL error: $err"];
-        }
+            $response = curl_exec($ch);
+            $err      = curl_error($ch);
+            $code     = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            curl_close($ch);
 
-        if ($code >= 200 && $code < 300 && is_string($response) && strlen(trim($response)) > 0) {
-            $resp = trim($response);
-            // Catbox mengembalikan URL penuh jika sukses, atau pesan error (teks)
-            if (filter_var($resp, FILTER_VALIDATE_URL)) {
-                return [true, $resp];
-            } else {
-                // Respons bukan URL: kemungkinan pesan error dari Catbox
-                if ($attempt < $maxRetry) {
-                    sleep(2);
-                    continue;
+            if ($err) {
+                // Kalau error HTTP/2/protocol, tandai untuk fallback stream
+                if (stripos($err, 'HTTP/2') !== false || stripos($err, 'PROTOCOL_ERROR') !== false) {
+                    $shouldFallback = true;
+                    break;
                 }
+                if ($attempt < $maxRetry) { usleep(400000); continue; }
+                return [false, "cURL error: $err"];
+            }
+
+            if ($code >= 200 && $code < 300 && is_string($response) && strlen(trim($response)) > 0) {
+                $resp = trim($response);
+                if (filter_var($resp, FILTER_VALIDATE_URL)) return [true, $resp];
+                if ($attempt < $maxRetry) { usleep(400000); continue; }
                 return [false, "Catbox response: $resp"];
+            } else {
+                if ($attempt < $maxRetry) { usleep(400000); continue; }
+                return [false, "HTTP $code, response: ".(string)$response];
             }
-        } else {
-            if ($attempt < $maxRetry) {
-                sleep(2);
-                continue;
+        }
+    } else {
+        $shouldFallback = true;
+    }
+
+    // ===== Fallback tanpa cURL: multipart manual via streams (HTTP/1.1 default) =====
+    for ($attempt = 1; $attempt <= $maxRetry; $attempt++) {
+        try {
+            $boundary = '----WebKitFormBoundary' . bin2hex(random_bytes(16));
+            $EOL = "\r\n";
+
+            $fileData = file_get_contents($filePath);
+            if ($fileData === false) {
+                return [false, "Gagal baca file: $filePath"];
             }
-            return [false, "HTTP $code, response: ".(string)$response];
+
+            $body  = '';
+            // reqtype
+            $body .= "--$boundary$EOL";
+            $body .= 'Content-Disposition: form-data; name="reqtype"' . $EOL . $EOL;
+            $body .= "fileupload$EOL";
+            // userhash
+            $body .= "--$boundary$EOL";
+            $body .= 'Content-Disposition: form-data; name="userhash"' . $EOL . $EOL;
+            $body .= $userhash . $EOL;
+            // fileToUpload
+            $body .= "--$boundary$EOL";
+            $body .= 'Content-Disposition: form-data; name="fileToUpload"; filename="' . addslashes($filename) . '"' . $EOL;
+            $body .= 'Content-Type: ' . $mime . $EOL . $EOL;
+            $body .= $fileData . $EOL;
+            // closing boundary
+            $body .= "--$boundary--$EOL";
+
+            $headers = [
+                "Content-Type: multipart/form-data; boundary=$boundary",
+                "Content-Length: " . strlen($body),
+                "User-Agent: PHP-StreamUploader/1.0",
+                "Connection: close",
+            ];
+
+            $context = stream_context_create([
+                'http' => [
+                    'method'        => 'POST',
+                    'header'        => implode("\r\n", $headers),
+                    'content'       => $body,
+                    'timeout'       => 90,
+                    'ignore_errors' => true, // dapatkan status walau error
+                ]
+            ]);
+
+            $response = @file_get_contents($endpoint, false, $context);
+
+            $status = 0;
+            if (isset($http_response_header[0]) && preg_match('#HTTP/\S+\s+(\d{3})#', $http_response_header[0], $m)) {
+                $status = (int)$m[1];
+            }
+
+            if ($response === false) {
+                if ($attempt < $maxRetry) { usleep(400000); continue; }
+                return [false, "Koneksi gagal (stream)"];
+            }
+
+            $resp = trim((string)$response);
+            if ($status >= 200 && $status < 300 && $resp !== '') {
+                if (filter_var($resp, FILTER_VALIDATE_URL)) return [true, $resp];
+                if ($attempt < $maxRetry) { usleep(400000); continue; }
+                return [false, "Catbox response: $resp"];
+            } else {
+                if ($attempt < $maxRetry) { usleep(400000); continue; }
+                return [false, "HTTP $status, response: $resp"];
+            }
+        } catch (Throwable $e) {
+            if ($attempt < $maxRetry) { usleep(400000); continue; }
+            return [false, "Exception: " . $e->getMessage()];
         }
     }
 
